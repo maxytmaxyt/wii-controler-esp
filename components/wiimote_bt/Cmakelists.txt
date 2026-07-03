@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "wiimote_bt.c"
+        "wiimote_sdp.c"
+        "wiimote_linkkey.c"
+        "wiimote_l2cap.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        bt
+        nvs_flash
+        esp_common
+        freertos
+)
