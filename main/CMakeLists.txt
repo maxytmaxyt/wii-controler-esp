@@ -5,4 +5,5 @@ idf_component_register(
         wiimote_bt
         nvs_flash
         freertos
+        driver
 )
