@@ -2,7 +2,7 @@
 
 Emulates a Nintendo Wii Remote (`RVL-CNT-01`) on an **ESP32 NodeMCU-32S** using Bluetooth Classic (BR/EDR).
 
-## Phase 2 — Bluetooth + D-Pad Input
+## Phase 2 — Bluetooth + D-Pad + A-Button
 
 - ✅ Discoverable as `Nintendo RVL-CNT-01`
 - ✅ Correct Class of Device (`0x002504`)
@@ -11,38 +11,46 @@ Emulates a Nintendo Wii Remote (`RVL-CNT-01`) on an **ESP32 NodeMCU-32S** using 
 - ✅ Wiimote PIN pairing protocol (reversed BDA)
 - ✅ Link key persistence in NVS (bond survives reboot)
 - ✅ Auto-reconnect to Wii after power cycle
-- ✅ Status report (0x20) response
-- ✅ ACK for data mode request (0x12)
-- ✅ D-Pad input (Up / Down / Left / Right) via GPIO
+- ✅ Status report (0x20) + ACK for data mode (0x12)
+- ✅ D-Pad: Up / Down / Left / Right
+- ✅ A-Button (confirm / select)
 
 ---
 
 ## Hardware
 
 - ESP32 NodeMCU-32S (any ESP32 with Bluetooth Classic)
-- 4× momentary push buttons for D-Pad (connect GPIO to GND)
+- 5× momentary push buttons
 
-### D-Pad GPIO Wiring
+### Wiring
 
-| Direction | GPIO | Wire     |
-|-----------|------|----------|
-| Up        | 32   | GPIO→GND |
-| Down      | 33   | GPIO→GND |
-| Left      | 25   | GPIO→GND |
-| Right     | 26   | GPIO→GND |
+Each button connects the GPIO pin to **GND**.  
+Internal pull-ups are enabled — **no external resistors needed**.
 
-Internal pull-ups are enabled — no external resistors needed.
-Change the pin numbers in `main/main.c` if your wiring differs.
+| Button      | GPIO | Board label (NodeMCU-32S) |
+|-------------|------|---------------------------|
+| D-Pad Up    | 18   | D18                       |
+| D-Pad Down  | 19   | D19                       |
+| D-Pad Left  | 21   | D21                       |
+| D-Pad Right | 22   | D22                       |
+| A Button    | 23   | D23                       |
+
+To use different pins, edit the `#define GPIO_*` lines at the top of `main/main.c`.
+
+**Avoid these pins** (reserved / boot-sensitive on ESP32):
+- GPIO 0, 2, 5, 12, 15 — boot-strapping
+- GPIO 6–11 — connected to internal flash
+- GPIO 34–39 — input-only (no pull-up, usable if you add external resistors)
 
 ---
 
 ## Build & Flash
 
 ```bash
-# With PlatformIO
+# PlatformIO
 pio run --target upload
 
-# With ESP-IDF directly
+# ESP-IDF
 idf.py build flash monitor
 ```
 
@@ -51,73 +59,40 @@ idf.py build flash monitor
 ## First-Time Pairing
 
 1. Flash the ESP32
-2. Open the battery cover of your Wii and press the red **SYNC** button
-3. The Wii will discover `Nintendo RVL-CNT-01` and pair
-4. D-Pad should work immediately after pairing
+2. Press the red **SYNC** button inside the Wii battery cover
+3. The Wii discovers `Nintendo RVL-CNT-01` and pairs
+4. Buttons work immediately after pairing
 
 ## Subsequent Connections
 
 1. Power on the ESP32
 2. Power on the Wii
-3. The ESP32 automatically reconnects — no SYNC button needed
+3. Reconnects automatically — no SYNC needed
 
 ---
 
-## Bluetooth Protocol Details
+## Core Button Report (0x30)
 
-| Parameter | Value |
-|-----------|-------|
-| Device Name | `Nintendo RVL-CNT-01` |
-| Class of Device | `0x002504` |
-| Vendor ID | `0x057E` (Nintendo) |
-| Product ID | `0x0306` |
-| HID Control PSM | `0x11` |
-| HID Interrupt PSM | `0x13` |
-| Pairing PIN | Reversed own BDA (6 bytes, binary) |
+### Byte 0 (D-Pad + Plus)
 
-### Core Button Report (0x30)
+| Bit | Mask | Button      |
+|-----|------|-------------|
+| 0   | 0x01 | D-Pad Left  |
+| 1   | 0x02 | D-Pad Right |
+| 2   | 0x04 | D-Pad Down  |
+| 3   | 0x08 | D-Pad Up    |
+| 4   | 0x10 | Plus (+)    |
 
-Byte 0 bitmask:
-- `0x01` D-Pad Left
-- `0x02` D-Pad Right
-- `0x04` D-Pad Down
-- `0x08` D-Pad Up
-- `0x10` Plus (+)
+### Byte 1 (Face buttons)
 
-Byte 1 bitmask:
-- `0x01` 2
-- `0x02` 1
-- `0x04` B
-- `0x08` A
-- `0x10` Minus (−)
-- `0x80` Home
-
----
-
-## Project Structure
-
-```
-esp32-wiimote/
-├── CMakeLists.txt
-├── platformio.ini
-├── sdkconfig.defaults
-├── partitions_wiimote.csv
-├── main/
-│   ├── CMakeLists.txt
-│   └── main.c                  # App entry + D-Pad GPIO task
-└── components/
-    └── wiimote_bt/
-        ├── CMakeLists.txt
-        ├── include/
-        │   ├── wiimote_bt.h    # Public API + button bitmasks
-        │   ├── wiimote_sdp.h   # SDP + HID descriptor
-        │   ├── wiimote_linkkey.h
-        │   └── wiimote_l2cap.h
-        ├── wiimote_bt.c        # GAP + auth + button reports
-        ├── wiimote_sdp.c       # SDP record registration
-        ├── wiimote_linkkey.c   # NVS persistence
-        └── wiimote_l2cap.c     # L2CAP PSM 0x11 + 0x13
-```
+| Bit | Mask | Button |
+|-----|------|--------|
+| 0   | 0x01 | 2      |
+| 1   | 0x02 | 1      |
+| 2   | 0x04 | B      |
+| 3   | 0x08 | **A**  |
+| 4   | 0x10 | Minus  |
+| 7   | 0x80 | Home   |
 
 ---
 
@@ -125,8 +100,8 @@ esp32-wiimote/
 
 - Phase 3: Accelerometer (3-axis)
 - Phase 4: LEDs + Rumble
-- Phase 5: IR camera (4-point tracking)
-- Phase 6: Extension port (Nunchuk, Classic Controller)
+- Phase 5: IR camera
+- Phase 6: Nunchuk / Classic Controller extension
 
 ---
 
