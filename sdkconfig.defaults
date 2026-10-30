@@ -31,5 +31,16 @@ CONFIG_NVS_ENCRYPTION=n
 # Stack sizes
 CONFIG_BT_BTC_TASK_STACK_SIZE=8192
 
+# FIX: HID BT task stack — 2048 (default) is too small for the full
+# GAP/PIN/SDP connection sequence and causes stack overflows on pairing.
+# 4096 gives comfortable headroom.
+CONFIG_ESPHID_TASK_SIZE_BT=4096
+
+# FIX: Custom partition table — without these entries PlatformIO's IDF
+# build ignores partitions_wiimote.csv and falls back to the single-app
+# default, leaving no room for the BT stack's NVS namespace.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_wiimote.csv"
+
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
