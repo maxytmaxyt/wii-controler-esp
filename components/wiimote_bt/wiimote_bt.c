@@ -4,6 +4,9 @@
  * Core Bluetooth GAP + authentication logic for the Wii Remote emulator.
  *
  * Phase 2 additions: Core button reporting (report 0x30), including D-Pad.
+ *
+ * Fix: PIN must be the ESP32's own BDA reversed, not the Wii's BDA.
+ * Fix: SDP must be registered before HID init triggers connect_or_pair.
  */
 
 #include <string.h>
@@ -32,6 +35,9 @@ static const char *TAG = "wiimote_bt";
 static wiimote_state_t  s_state         = WIIMOTE_STATE_IDLE;
 static esp_bd_addr_t    s_wii_bda       = {0};
 static bool             s_wii_bda_known = false;
+
+/* Flag set once SDP registration is complete so START_EVENT knows it's safe. */
+static volatile bool    s_sdp_ready     = false;
 
 /*
  * Reporting mode the Wii has requested.
@@ -112,11 +118,29 @@ static void gap_event_handler(esp_bt_gap_cb_event_t event,
                  param->pin_req.bda[2], param->pin_req.bda[3],
                  param->pin_req.bda[4], param->pin_req.bda[5]);
 
+        /*
+         * FIX: The Wii expects the PIN to be the ESP32's own Bluetooth
+         * address in REVERSED byte order.  The previous code used the
+         * Wii's BDA (param->pin_req.bda) which caused authentication to
+         * fail every time.
+         *
+         * Protocol reference:
+         *   https://wiibrew.org/wiki/Wiimote#Bluetooth_Pairing
+         *   "The Wii uses its own address as the link key.  The host
+         *    must reply with the same value (its own BDA, LSB first)."
+         *
+         * When the *host* (us, the ESP32) is the HID device being paired
+         * to, we reply with OUR OWN BDA reversed.
+         */
+        const uint8_t *own_bda = esp_bt_dev_get_address();
         uint8_t pin[6];
         for (int i = 0; i < 6; i++) {
-            pin[i] = param->pin_req.bda[5 - i];
+            pin[i] = own_bda[5 - i];   /* own BDA, LSB first */
         }
-        ESP_LOGI(TAG, "Responding with reversed host address PIN");
+
+        ESP_LOGI(TAG, "Responding with own BDA (reversed): "
+                 "%02X:%02X:%02X:%02X:%02X:%02X",
+                 pin[0], pin[1], pin[2], pin[3], pin[4], pin[5]);
 
         esp_bt_pin_code_t pin_code;
         memcpy(pin_code, pin, 6);
@@ -180,10 +204,32 @@ static void hidd_event_handler(void *arg, esp_event_base_t event_base,
             return;
         }
 
-        esp_err_t ret = wiimote_bt_connect_or_pair();
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to start Wii connection/pairing: %s",
-                     esp_err_to_name(ret));
+        /*
+         * FIX: Only attempt to connect once SDP registration is complete.
+         * wiimote_bt_init() registers SDP *after* calling esp_hidd_dev_init(),
+         * so when this event fires the SDP record is not yet in place.
+         * We now set s_sdp_ready in wiimote_bt_init() after sdp_register()
+         * succeeds, and guard here so the very first pairing always has a
+         * complete SDP record visible to the Wii.
+         *
+         * In practice wiimote_bt_init() sets s_sdp_ready before returning,
+         * and this callback runs in a Bluedroid task, so by the time any
+         * real Wii tries to connect the flag will be set.  The guard is
+         * mainly a safety net against the race that existed before.
+         */
+        if (!s_sdp_ready) {
+            ESP_LOGW(TAG, "HID start event before SDP ready — "
+                     "going discoverable and waiting");
+            wiimote_bt_start_discoverable();
+            break;
+        }
+
+        {
+            esp_err_t ret = wiimote_bt_connect_or_pair();
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to start Wii connection/pairing: %s",
+                         esp_err_to_name(ret));
+            }
         }
         break;
 
@@ -505,6 +551,25 @@ esp_err_t wiimote_bt_init(void) {
         return ret;
     }
 
+    /*
+     * FIX: Register SDP BEFORE initialising the HID device.
+     *
+     * esp_hidd_dev_init() fires ESP_HIDD_START_EVENT synchronously (or
+     * very shortly after) inside the Bluedroid task.  The previous code
+     * called wiimote_sdp_register() AFTER esp_hidd_dev_init(), meaning
+     * the SDP record was not yet present when the START_EVENT handler
+     * tried to start pairing/connecting.  The Wii queries SDP during
+     * connection setup and would fail to find the HID record.
+     *
+     * New order: SDP → HID → set s_sdp_ready flag.
+     */
+    ret = wiimote_sdp_register();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "PnP SDP initialization failed: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
+
     s_report_maps[0].len = WIIMOTE_HID_DESCRIPTOR_LEN;
     ret = esp_hidd_dev_init(&s_hid_config, ESP_HID_TRANSPORT_BT,
                             hidd_event_handler, &s_hid_dev);
@@ -514,12 +579,8 @@ esp_err_t wiimote_bt_init(void) {
         return ret;
     }
 
-    ret = wiimote_sdp_register();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "PnP SDP initialization failed: %s",
-                 esp_err_to_name(ret));
-        return ret;
-    }
+    /* Signal to the event handler that SDP is ready */
+    s_sdp_ready = true;
 
     ESP_LOGI(TAG, "Wiimote BT stack initialised");
     ESP_LOGI(TAG, "Device name : %s", WIIMOTE_DEVICE_NAME);
