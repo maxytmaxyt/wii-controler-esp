@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdint.h>
-#include <stddef.h>
+#include <stdbool.h>
 #include "esp_err.h"
 #include "esp_bt_defs.h"
 
@@ -19,17 +19,20 @@ extern "C" {
  * On initial pairing the Wii connects to us (outbound from the Wii's
  * perspective, inbound for us). On subsequent auto-reconnect the
  * Wiimote (i.e. us) connects to the Wii.
- *
- * Both modes are handled here.
  */
 
-/* Maximum HID payload we will ever send or receive */
-#define L2CAP_MAX_PAYLOAD_LEN  22  /* 1 prefix + 1 report ID + 20 data */
+/*
+ * Maximum HID payload we will ever send.
+ * The largest Wiimote input report is 21 bytes (e.g. 0x34–0x37).
+ * The packet on the wire adds 2 bytes (0xA1 prefix + report_id),
+ * so the internal buffer is L2CAP_MAX_PAYLOAD_LEN + 2 bytes.
+ */
+#define L2CAP_MAX_PAYLOAD_LEN  21
 
-/* Callback types */
+/* Callback type for output reports received from the Wii */
 typedef void (*l2cap_output_report_cb_t)(const uint8_t *data, uint16_t len);
 
-/* Initialise L2CAP server (listen on PSM 0x11 + 0x13) */
+/* Initialise L2CAP: register callback, init stack, listen on PSM 0x11+0x13 */
 esp_err_t wiimote_l2cap_init(l2cap_output_report_cb_t output_cb);
 
 /* Connect outbound to a Wii (for auto-reconnect) */
