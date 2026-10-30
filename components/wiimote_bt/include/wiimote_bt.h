@@ -15,7 +15,10 @@ extern "C" {
 
 #define WIIMOTE_DEVICE_NAME        "Nintendo RVL-CNT-01"
 
-#define WIIMOTE_COD_MAJOR          0x0500
+/* esp_bt_cod_t.major is the raw Major Device Class number (not bit-shifted).
+ * 0x05 = Peripheral (keyboards, mice, game controllers).
+ * 0x04 minor = Gamepad.  Combined CoD: 0x002504. */
+#define WIIMOTE_COD_MAJOR          0x05
 #define WIIMOTE_COD_MINOR          0x04
 
 #define HID_PSM_CONTROL            0x11
