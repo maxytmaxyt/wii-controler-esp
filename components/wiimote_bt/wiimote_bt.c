@@ -5,8 +5,20 @@
  *
  * Phase 2 additions: Core button reporting (report 0x30), including D-Pad.
  *
- * Fix: PIN must be the ESP32's own BDA reversed, not the Wii's BDA.
- * Fix: SDP must be registered before HID init triggers connect_or_pair.
+ * Fix (init order): SDP must be registered before HID init triggers
+ *   connect_or_pair — see wiimote_bt_init() for details.
+ *
+ * PIN protocol (WiiBrew reference: https://wiibrew.org/wiki/Wiimote):
+ *   BONDING  (red Sync button): PIN = Wii's own BDA, reversed (LSB first)
+ *   TEMPORARY (1+2 buttons)  : PIN = Wiimote's BDA, reversed (LSB first)
+ *
+ * The Wii is always the HOST.  The ESP32 is the WIIMOTE (HID device).
+ * During a Sync-button bond, param->pin_req.bda holds the Wii's address
+ * — so we reply with that address reversed.  This is what the original
+ * code did, and it is correct per the protocol spec.
+ *
+ * The previous "fix" that replaced it with our own BDA was wrong and has
+ * been reverted.
  */
 
 #include <string.h>
@@ -36,13 +48,12 @@ static wiimote_state_t  s_state         = WIIMOTE_STATE_IDLE;
 static esp_bd_addr_t    s_wii_bda       = {0};
 static bool             s_wii_bda_known = false;
 
-/* Flag set once SDP registration is complete so START_EVENT knows it's safe. */
+/* Flag set once SDP registration is complete so START_EVENT knows it is safe */
 static volatile bool    s_sdp_ready     = false;
 
 /*
  * Reporting mode the Wii has requested.
- * 0x30 = Core Buttons only (our default when not set by Wii).
- * We track it so we can send the right report format.
+ * 0x30 = Core Buttons only (default until the Wii sends 0x12).
  */
 static uint8_t s_report_mode = 0x30;
 
@@ -80,7 +91,8 @@ static void output_report_handler(const uint8_t *data, uint16_t len);
 static void send_status_report(void);
 static esp_err_t load_wii_bda(void);
 static esp_err_t save_wii_bda(const esp_bd_addr_t bda);
-static esp_err_t send_input_report(uint8_t report_id, const uint8_t *payload, uint16_t len);
+static esp_err_t send_input_report(uint8_t report_id,
+                                   const uint8_t *payload, uint16_t len);
 
 /* -----------------------------------------------------------------------
  * GAP Event Handler
@@ -119,26 +131,22 @@ static void gap_event_handler(esp_bt_gap_cb_event_t event,
                  param->pin_req.bda[4], param->pin_req.bda[5]);
 
         /*
-         * FIX: The Wii expects the PIN to be the ESP32's own Bluetooth
-         * address in REVERSED byte order.  The previous code used the
-         * Wii's BDA (param->pin_req.bda) which caused authentication to
-         * fail every time.
+         * WiiBrew Wiimote#Bluetooth_Pairing:
+         *   "The PIN code for bonding is the binary Bluetooth address of
+         *    the host machine, in reverse."
          *
-         * Protocol reference:
-         *   https://wiibrew.org/wiki/Wiimote#Bluetooth_Pairing
-         *   "The Wii uses its own address as the link key.  The host
-         *    must reply with the same value (its own BDA, LSB first)."
+         * The HOST is the Wii.  param->pin_req.bda IS the Wii's address.
+         * So the correct PIN is the Wii's BDA reversed (LSB first).
          *
-         * When the *host* (us, the ESP32) is the HID device being paired
-         * to, we reply with OUR OWN BDA reversed.
+         * Confirmed by MaxLiebe/wiimote-anything:
+         *   "Pairing during sync uses the Wii's BD_ADDR reversed as the PIN."
          */
-        const uint8_t *own_bda = esp_bt_dev_get_address();
         uint8_t pin[6];
         for (int i = 0; i < 6; i++) {
-            pin[i] = own_bda[5 - i];   /* own BDA, LSB first */
+            pin[i] = param->pin_req.bda[5 - i];   /* Wii BDA, LSB first */
         }
 
-        ESP_LOGI(TAG, "Responding with own BDA (reversed): "
+        ESP_LOGI(TAG, "Responding with Wii BDA reversed (correct bonding PIN): "
                  "%02X:%02X:%02X:%02X:%02X:%02X",
                  pin[0], pin[1], pin[2], pin[3], pin[4], pin[5]);
 
@@ -177,7 +185,6 @@ static void gap_event_handler(esp_bt_gap_cb_event_t event,
         ESP_LOGI(TAG, "ACL disconnected: reason=%d",
                  param->acl_disconn_cmpl_stat.reason);
         s_state = WIIMOTE_STATE_IDLE;
-        /* Reset report mode to default on disconnect */
         s_report_mode = 0x30;
         break;
 
@@ -205,17 +212,10 @@ static void hidd_event_handler(void *arg, esp_event_base_t event_base,
         }
 
         /*
-         * FIX: Only attempt to connect once SDP registration is complete.
-         * wiimote_bt_init() registers SDP *after* calling esp_hidd_dev_init(),
-         * so when this event fires the SDP record is not yet in place.
-         * We now set s_sdp_ready in wiimote_bt_init() after sdp_register()
-         * succeeds, and guard here so the very first pairing always has a
-         * complete SDP record visible to the Wii.
-         *
-         * In practice wiimote_bt_init() sets s_sdp_ready before returning,
-         * and this callback runs in a Bluedroid task, so by the time any
-         * real Wii tries to connect the flag will be set.  The guard is
-         * mainly a safety net against the race that existed before.
+         * Guard: only attempt connect/pair once SDP is registered.
+         * wiimote_bt_init() sets s_sdp_ready=true after sdp_register()
+         * succeeds, which happens before esp_hidd_dev_init() returns.
+         * This guard catches any race where the event fires before that.
          */
         if (!s_sdp_ready) {
             ESP_LOGW(TAG, "HID start event before SDP ready — "
@@ -247,7 +247,7 @@ static void hidd_event_handler(void *arg, esp_event_base_t event_base,
             esp_err_t ret = esp_bt_gap_set_scan_mode(
                 ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
             if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to disable Bluetooth discoverability: %s",
+                ESP_LOGE(TAG, "Failed to disable discoverability: %s",
                          esp_err_to_name(ret));
             }
         }
@@ -312,8 +312,14 @@ static void output_report_handler(const uint8_t *data, uint16_t len) {
     switch (report_id) {
     case WIIMOTE_OUT_STATUS_REQ:
         /*
-         * 0x15: Status request — must respond within ~1 second or Wii
-         * disconnects the controller.
+         * 0x15: Status request — must respond within ~1 second or the
+         * Wii disconnects the controller.
+         *
+         * WiiBrew: "If this report is received when NOT requested, the
+         * application MUST send report 0x12 to change the data reporting
+         * mode, otherwise no further data reports will be received."
+         * We handle 0x12 in the DATA_MODE case below; the Wii always
+         * sends 0x12 after receiving our 0x20 reply, so this is fine.
          */
         ESP_LOGI(TAG, "Status request received → sending status report");
         send_status_report();
@@ -329,20 +335,18 @@ static void output_report_handler(const uint8_t *data, uint16_t len) {
          * Byte 1: flags (bit 2 = continuous)
          * Byte 2: report mode ID (e.g. 0x30 = core buttons)
          *
-         * Store the requested mode and send an ACK (0x22).
-         * If we don't ACK, the Wii may resend or disconnect.
+         * Store the requested mode and send ACK 0x22.
          */
         if (len >= 3) {
             s_report_mode = data[2];
             ESP_LOGI(TAG, "Data mode set: continuous=%d mode=0x%02X",
                      (data[1] & 0x04) >> 2, s_report_mode);
         }
-        /* Send ACK for 0x12 */
         {
             uint8_t ack[4] = {
-                0x00, 0x00,          /* Core buttons: none */
-                WIIMOTE_OUT_DATA_MODE, /* report ID being ACKed */
-                0x00,                /* error code 0 = success */
+                0x00, 0x00,
+                WIIMOTE_OUT_DATA_MODE,
+                0x00,
             };
             send_input_report(WIIMOTE_IN_ACK, ack, sizeof(ack));
         }
@@ -361,14 +365,27 @@ static void output_report_handler(const uint8_t *data, uint16_t len) {
 
 /* -----------------------------------------------------------------------
  * Send status report 0x20 to the Wii
+ *
+ * WiiBrew format: (a1) 20 BB BB LF 00 00 VV
+ *   BB BB = core buttons (none pressed → 0x00 0x00)
+ *   LF    = flags byte:  bits 4-7 = LED state, bits 0-3 = status flags
+ *   VV    = battery level
+ *
+ * The Wii will respond with output report 0x12 to (re-)set the data mode.
  * ----------------------------------------------------------------------- */
 static void send_status_report(void) {
+    /*
+     * payload[0..1] = core buttons (none)
+     * payload[2]    = LF byte: LED1 on (bit 4 = 0x10), battery OK
+     * payload[3..4] = 0x00 (reserved)
+     * payload[5]    = 0x80 (battery level: full)
+     */
     uint8_t status[6] = {
-        0x00, 0x00,           /* Core buttons: none pressed */
-        STATUS_FLAG_LED1,     /* LED1 on, battery OK */
+        0x00, 0x00,
+        STATUS_FLAG_LED1,
         0x00,
         0x00,
-        0x80,                 /* Battery level: full */
+        0x80,
     };
 
     esp_err_t ret = send_input_report(WIIMOTE_IN_STATUS,
@@ -381,18 +398,9 @@ static void send_status_report(void) {
     }
 }
 
-/* -----------------------------------------------------------------------
- * Public: Send core button report (Phase 2 — D-Pad + buttons)
- *
- * Report 0x30: Core Buttons (2 bytes)
- *   Byte 0: D-Pad + Plus  (BTN_BYTE0_*)
- *   Byte 1: A/B/1/2/Minus/Home  (BTN_BYTE1_*)
- *
- * The Wii expects to receive this report continuously in "continuous" mode
- * (set via 0x12 data mode). In non-continuous mode, send on state change.
- * We always send on state change regardless; the Wii handles both.
- * ----------------------------------------------------------------------- */
-static esp_err_t send_input_report(uint8_t report_id, const uint8_t *payload, uint16_t len) {
+/* ----------------------------------------------------------------------- */
+static esp_err_t send_input_report(uint8_t report_id,
+                                   const uint8_t *payload, uint16_t len) {
     if (s_hid_dev == NULL) return ESP_ERR_INVALID_STATE;
     uint8_t report[64];
     if (len > sizeof(report)) return ESP_ERR_INVALID_ARG;
@@ -404,15 +412,7 @@ esp_err_t wiimote_bt_send_buttons(uint8_t btn_byte0, uint8_t btn_byte1) {
     if (s_state != WIIMOTE_STATE_CONNECTED) {
         return ESP_ERR_INVALID_STATE;
     }
-
-    /*
-     * We always send report 0x30 (Core Buttons) regardless of
-     * s_report_mode because it is the baseline format. If the Wii
-     * requests 0x31 (buttons + accelerometer) we would need to pad
-     * with 3 accelerometer bytes — Phase 3 concern.
-     */
     uint8_t payload[2] = { btn_byte0, btn_byte1 };
-
     esp_err_t ret = send_input_report(WIIMOTE_IN_BUTTONS,
                                       payload, sizeof(payload));
     if (ret != ESP_OK) {
@@ -468,6 +468,9 @@ static esp_err_t save_wii_bda(const esp_bd_addr_t bda) {
 
 /* -----------------------------------------------------------------------
  * Public API: wiimote_bt_init
+ *
+ * Init order: SDP first, then HID (fixes race where START_EVENT fired
+ * before SDP record was registered and the Wii rejected the connection).
  * ----------------------------------------------------------------------- */
 esp_err_t wiimote_bt_init(void) {
     esp_err_t ret;
@@ -519,12 +522,6 @@ esp_err_t wiimote_bt_init(void) {
         return ret;
     }
 
-    /*
-     * Set Class of Device: 0x002504
-     * esp_bt_cod_t is a struct — use designated initialiser (C99/C11).
-     * We declare it as a variable first to avoid compound-literal
-     * compatibility issues with some IDF versions.
-     */
     {
         esp_bt_cod_t cod;
         memset(&cod, 0, sizeof(cod));
@@ -538,7 +535,7 @@ esp_err_t wiimote_bt_init(void) {
         }
     }
 
-    /* IO capability: none → legacy pairing (PIN-based) */
+    /* IO capability: none → legacy pairing (PIN-based, no SSP) */
     {
         esp_bt_sp_param_t sp_param = ESP_BT_SP_IOCAP_MODE;
         uint8_t iocap = ESP_BT_IO_CAP_NONE;
@@ -551,18 +548,8 @@ esp_err_t wiimote_bt_init(void) {
         return ret;
     }
 
-    /*
-     * FIX: Register SDP BEFORE initialising the HID device.
-     *
-     * esp_hidd_dev_init() fires ESP_HIDD_START_EVENT synchronously (or
-     * very shortly after) inside the Bluedroid task.  The previous code
-     * called wiimote_sdp_register() AFTER esp_hidd_dev_init(), meaning
-     * the SDP record was not yet present when the START_EVENT handler
-     * tried to start pairing/connecting.  The Wii queries SDP during
-     * connection setup and would fail to find the HID record.
-     *
-     * New order: SDP → HID → set s_sdp_ready flag.
-     */
+    /* Register SDP BEFORE initialising HID so the record exists when
+     * ESP_HIDD_START_EVENT fires and triggers connect_or_pair(). */
     ret = wiimote_sdp_register();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "PnP SDP initialization failed: %s",
@@ -579,7 +566,7 @@ esp_err_t wiimote_bt_init(void) {
         return ret;
     }
 
-    /* Signal to the event handler that SDP is ready */
+    /* Signal to the event handler that SDP is in place */
     s_sdp_ready = true;
 
     ESP_LOGI(TAG, "Wiimote BT stack initialised");
@@ -598,7 +585,7 @@ esp_err_t wiimote_bt_start_discoverable(void) {
     esp_err_t ret = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE,
                                               ESP_BT_GENERAL_DISCOVERABLE);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable Bluetooth discoverability: %s",
+        ESP_LOGE(TAG, "Failed to enable discoverability: %s",
                  esp_err_to_name(ret));
         return ret;
     }
