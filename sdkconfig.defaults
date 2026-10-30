@@ -4,6 +4,11 @@ CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
 CONFIG_BT_CLASSIC_ENABLED=y
 CONFIG_BT_SPP_ENABLED=n
 
+# CRITICAL: Disable SSP — the Wii uses Legacy Pairing with raw binary PINs.
+# If SSP is active, Bluedroid forces modern key negotiation and the Wii
+# immediately drops the connection.
+CONFIG_BT_SSP_ENABLED=n
+
 # BLE off - we only need Classic
 CONFIG_BT_BLE_ENABLED=n
 CONFIG_GATTS_ENABLE=n
