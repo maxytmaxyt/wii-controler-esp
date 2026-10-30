@@ -114,7 +114,8 @@ typedef enum {
 
 /* Public API */
 esp_err_t       wiimote_bt_init(void);
-void            wiimote_bt_start_discoverable(void);
+esp_err_t       wiimote_bt_start_discoverable(void);
+esp_err_t       wiimote_bt_connect_or_pair(void);
 void            wiimote_bt_stop_discoverable(void);
 wiimote_state_t wiimote_bt_get_state(void);
 
@@ -129,6 +130,8 @@ wiimote_state_t wiimote_bt_get_state(void);
  * The Wii uses polling, not edge events.
  */
 esp_err_t wiimote_bt_send_buttons(uint8_t btn_byte0, uint8_t btn_byte1);
+esp_err_t wiimote_bt_send_buttons_accel(uint8_t btn_byte0, uint8_t btn_byte1,
+                                       uint8_t ax, uint8_t ay, uint8_t az);
 
 #ifdef __cplusplus
 }

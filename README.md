@@ -2,7 +2,7 @@
 
 Emulates a Nintendo Wii Remote (`RVL-CNT-01`) on an **ESP32 NodeMCU-32S** using Bluetooth Classic (BR/EDR).
 
-## Phase 2 — Bluetooth + D-Pad + A-Button
+## Browser controls — Bluetooth + virtual buttons
 
 - ✅ Discoverable as `Nintendo RVL-CNT-01`
 - ✅ Correct Class of Device (`0x002504`)
@@ -12,35 +12,30 @@ Emulates a Nintendo Wii Remote (`RVL-CNT-01`) on an **ESP32 NodeMCU-32S** using 
 - ✅ Bluetooth bond persistence through Bluedroid NVS storage
 - ✅ Auto-reconnect to Wii after power cycle
 - ✅ Status report (0x20) + ACK for data mode (0x12)
-- ✅ D-Pad: Up / Down / Left / Right
-- ✅ A-Button (confirm / select)
+- ✅ Browser controller with D-Pad, A/B/1/2, Plus, Minus and Home
+- ✅ Touch, mouse and keyboard controls with simultaneous button presses
 
 ---
 
 ## Hardware
 
 - ESP32 NodeMCU-32S (any ESP32 with Bluetooth Classic)
-- 5× momentary push buttons
+- Phone, tablet or computer with Wi-Fi and a modern browser
 
-### Wiring
+### Open the web controller
 
-Each button connects the GPIO pin to **GND**.  
-Internal pull-ups are enabled — **no external resistors needed**.
+No external buttons or wiring are required. The ESP32 starts its own Wi-Fi
+access point and hosts the controller page:
 
-| Button      | GPIO | Board label (NodeMCU-32S) |
-|-------------|------|---------------------------|
-| D-Pad Up    | 18   | D18                       |
-| D-Pad Down  | 19   | D19                       |
-| D-Pad Left  | 21   | D21                       |
-| D-Pad Right | 22   | D22                       |
-| A Button    | 23   | D23                       |
+1. Connect your device to the Wi-Fi network **WiiRemote-ESP32**.
+2. Enter the password **wiiremote**.
+3. Open **http://192.168.4.1/** in a browser.
+4. Click **Verbinden / Pairing starten** in the page.
+5. To pair for the first time, press the **SYNC** button on the Wii console
+   (behind the front cover), then hold buttons on the web page to control it.
 
-To use different pins, edit the `#define GPIO_*` lines at the top of `src/main.c`.
-
-**Avoid these pins** (reserved / boot-sensitive on ESP32):
-- GPIO 0, 2, 5, 12, 15 — boot-strapping
-- GPIO 6–11 — connected to internal flash
-- GPIO 34–39 — input-only (no pull-up, usable if you add external resistors)
+The access point has no internet connection. If your device asks, stay
+connected to the network.
 
 ---
 
@@ -58,10 +53,12 @@ idf.py build flash monitor
 
 ## First-Time Pairing
 
-1. Flash the ESP32
-2. Press the red **SYNC** button inside the Wii battery cover
-3. The Wii discovers `Nintendo RVL-CNT-01` and pairs
-4. Buttons work immediately after pairing
+1. Flash the ESP32 and connect to its web page.
+2. Click **Verbinden / Pairing starten** to make the ESP32 discoverable.
+3. Press the **SYNC** button on the Wii console (behind the front cover).
+   Do not press SYNC on a Wii Remote; the ESP32 is emulating that remote.
+4. The Wii discovers `Nintendo RVL-CNT-01` and pairs. Buttons work after
+   the connection is established.
 
 ## Subsequent Connections
 

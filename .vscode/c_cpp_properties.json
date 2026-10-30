@@ -523,7 +523,6 @@
                 "ESP_PLATFORM",
                 "PLATFORMIO=60119",
                 "ARDUINO_NodeMCU_32S",
-                "LOG_LOCAL_LEVEL=ESP_LOG_DEBUG",
                 ""
             ],
             "cStandard": "gnu23",
