@@ -15,12 +15,14 @@
 #include "esp_bt_main.h"
 #include "esp_gap_bt_api.h"
 #include "esp_bt_device.h"
+#include "esp_event.h"
+#include "esp_hid_common.h"
+#include "esp_hidd.h"
+#include "esp_hidd_api.h"
 #include "nvs_flash.h"
 
 #include "wiimote_bt.h"
 #include "wiimote_sdp.h"
-#include "wiimote_linkkey.h"
-#include "wiimote_l2cap.h"
 
 static const char *TAG = "wiimote_bt";
 
@@ -39,16 +41,42 @@ static bool             s_wii_bda_known = false;
 static uint8_t s_report_mode = 0x30;
 
 #define NVS_KEY_WII_BDA  "wii_bda"
+#define WIIMOTE_MAX_REPORT_LEN 21
+
+static esp_hid_raw_report_map_t s_report_maps[] = {
+    {
+        .data = WIIMOTE_HID_DESCRIPTOR,
+        .len = 0,
+    },
+};
+
+static const esp_hid_device_config_t s_hid_config = {
+    .vendor_id = WIIMOTE_VENDOR_ID,
+    .product_id = WIIMOTE_PRODUCT_ID,
+    .version = WIIMOTE_VERSION,
+    .device_name = WIIMOTE_DEVICE_NAME,
+    .manufacturer_name = "Nintendo",
+    .serial_number = "000000000001",
+    .report_maps = s_report_maps,
+    .report_maps_len = sizeof(s_report_maps) / sizeof(s_report_maps[0]),
+};
+
+static esp_hidd_dev_t *s_hid_dev;
 
 /* -----------------------------------------------------------------------
  * Forward declarations
  * ----------------------------------------------------------------------- */
 static void gap_event_handler(esp_bt_gap_cb_event_t event,
                               esp_bt_gap_cb_param_t *param);
+static void hidd_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data);
 static void output_report_handler(const uint8_t *data, uint16_t len);
 static void send_status_report(void);
 static esp_err_t load_wii_bda(void);
 static esp_err_t save_wii_bda(const esp_bd_addr_t bda);
+static esp_err_t send_input_report(uint8_t report_id,
+                                   const uint8_t *payload, uint16_t len);
+static void reconnect_task(void *arg);
 
 /* -----------------------------------------------------------------------
  * GAP Event Handler
@@ -69,8 +97,8 @@ static void gap_event_handler(esp_bt_gap_cb_event_t event,
             s_wii_bda_known = true;
             save_wii_bda(s_wii_bda);
 
-            s_state = WIIMOTE_STATE_CONNECTED;
-            ESP_LOGI(TAG, "Authentication successful — state: CONNECTED");
+            s_state = WIIMOTE_STATE_AUTHENTICATING;
+            ESP_LOGI(TAG, "Authentication successful");
         } else {
             ESP_LOGE(TAG, "Authentication FAILED: status=%d",
                      param->auth_cmpl.stat);
@@ -102,55 +130,6 @@ static void gap_event_handler(esp_bt_gap_cb_event_t event,
         break;
     }
 
-    case ESP_BT_GAP_LINK_KEY_NOTIF_EVT: {
-        ESP_LOGI(TAG, "Link key notification from "
-                 "%02X:%02X:%02X:%02X:%02X:%02X  type=%d",
-                 param->link_key_notif.bda[0], param->link_key_notif.bda[1],
-                 param->link_key_notif.bda[2], param->link_key_notif.bda[3],
-                 param->link_key_notif.bda[4], param->link_key_notif.bda[5],
-                 param->link_key_notif.key_type);
-
-        wiimote_linkkey_store(param->link_key_notif.bda,
-                              param->link_key_notif.link_key,
-                              (uint8_t)param->link_key_notif.key_type);
-        break;
-    }
-
-    case ESP_BT_GAP_LINK_KEY_REQ_EVT: {
-        ESP_LOGI(TAG, "Link key request from "
-                 "%02X:%02X:%02X:%02X:%02X:%02X",
-                 param->link_key_req.bda[0], param->link_key_req.bda[1],
-                 param->link_key_req.bda[2], param->link_key_req.bda[3],
-                 param->link_key_req.bda[4], param->link_key_req.bda[5]);
-
-        uint8_t key[16];
-        uint8_t key_type;
-        if (wiimote_linkkey_find(param->link_key_req.bda, key, &key_type)) {
-            ESP_LOGI(TAG, "Found link key — sending to Wii");
-            /*
-             * esp_bt_gap_set_link_key(bda, key) — ESP-IDF ≥ 5.1 public API.
-             * Provides the stored 16-byte link key to Bluedroid, which replies
-             * to the HCI LINK_KEY_REQUEST with HCI_LINK_KEY_REPLY.
-             */
-            esp_link_key link_key;
-            memcpy(link_key, key, sizeof(esp_link_key));
-            esp_bt_gap_set_link_key(param->link_key_req.bda, link_key);
-        } else {
-            ESP_LOGW(TAG, "No link key found — negative reply");
-            /*
-             * For a negative link key reply we call esp_bt_gap_set_link_key
-             * with a zeroed key buffer. Bluedroid detects an all-zero key as
-             * invalid and sends HCI_LINK_KEY_NEG_REPLY, which causes the Wii
-             * to fall back to PIN pairing — the correct behaviour for a
-             * first-time or unrecognised device.
-             */
-            esp_link_key zero_key;
-            memset(zero_key, 0, sizeof(esp_link_key));
-            esp_bt_gap_set_link_key(param->link_key_req.bda, zero_key);
-        }
-        break;
-    }
-
     case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
         break;
 
@@ -167,8 +146,7 @@ static void gap_event_handler(esp_bt_gap_cb_event_t event,
         break;
 
     case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
-        ESP_LOGI(TAG, "ACL disconnected: status=%d reason=%d",
-                 param->acl_disconn_cmpl_stat.stat,
+        ESP_LOGI(TAG, "ACL disconnected: reason=%d",
                  param->acl_disconn_cmpl_stat.reason);
         s_state = WIIMOTE_STATE_IDLE;
         /* Reset report mode to default on disconnect */
@@ -177,6 +155,93 @@ static void gap_event_handler(esp_bt_gap_cb_event_t event,
 
     default:
         ESP_LOGD(TAG, "Unhandled GAP event: %d", event);
+        break;
+    }
+}
+
+static void hidd_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_base;
+
+    esp_hidd_event_t event = (esp_hidd_event_t)event_id;
+    esp_hidd_event_data_t *param = event_data;
+
+    switch (event) {
+    case ESP_HIDD_START_EVENT:
+        if (param->start.status != ESP_OK) {
+            ESP_LOGE(TAG, "HID device profile failed to start: %s",
+                     esp_err_to_name(param->start.status));
+            return;
+        }
+
+        if (s_wii_bda_known) {
+            if (xTaskCreate(reconnect_task, "wii_reconnect", 4096,
+                            NULL, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "Failed to create reconnect task");
+                wiimote_bt_start_discoverable();
+            }
+        } else {
+            wiimote_bt_start_discoverable();
+        }
+        break;
+
+    case ESP_HIDD_CONNECT_EVENT:
+        if (param->connect.status != ESP_OK) {
+            ESP_LOGE(TAG, "HID connection failed: %s",
+                     esp_err_to_name(param->connect.status));
+            s_state = WIIMOTE_STATE_IDLE;
+            break;
+        }
+        ESP_LOGI(TAG, "HID host connected");
+        s_state = WIIMOTE_STATE_CONNECTED;
+        esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE,
+                                 ESP_BT_NON_DISCOVERABLE);
+        break;
+
+    case ESP_HIDD_DISCONNECT_EVENT:
+        ESP_LOGI(TAG, "HID host disconnected");
+        s_state = WIIMOTE_STATE_IDLE;
+        s_report_mode = 0x30;
+        wiimote_bt_start_discoverable();
+        break;
+
+    case ESP_HIDD_OUTPUT_EVENT: {
+        uint8_t report[WIIMOTE_MAX_REPORT_LEN + 1];
+        if (param->output.length > WIIMOTE_MAX_REPORT_LEN ||
+            (param->output.length > 0 && param->output.data == NULL)) {
+            ESP_LOGE(TAG, "Invalid HID output report length: %u",
+                     param->output.length);
+            break;
+        }
+        report[0] = (uint8_t)param->output.report_id;
+        if (param->output.length > 0) {
+            memcpy(&report[1], param->output.data, param->output.length);
+        }
+        output_report_handler(report, param->output.length + 1);
+        break;
+    }
+
+    case ESP_HIDD_FEATURE_EVENT:
+        if (param->feature.trans_type == ESP_HID_TRANS_SET_REPORT) {
+            uint8_t report[WIIMOTE_MAX_REPORT_LEN + 1];
+            if (param->feature.length > WIIMOTE_MAX_REPORT_LEN ||
+                (param->feature.length > 0 && param->feature.data == NULL)) {
+                ESP_LOGE(TAG, "Invalid HID feature report length: %u",
+                         param->feature.length);
+                break;
+            }
+            report[0] = (uint8_t)param->feature.report_id;
+            if (param->feature.length > 0) {
+                memcpy(&report[1], param->feature.data,
+                       param->feature.length);
+            }
+            output_report_handler(report, param->feature.length + 1);
+        }
+        break;
+
+    default:
         break;
     }
 }
@@ -226,7 +291,7 @@ static void output_report_handler(const uint8_t *data, uint16_t len) {
                 WIIMOTE_OUT_DATA_MODE, /* report ID being ACKed */
                 0x00,                /* error code 0 = success */
             };
-            wiimote_l2cap_send_input(WIIMOTE_IN_ACK, ack, sizeof(ack));
+            send_input_report(WIIMOTE_IN_ACK, ack, sizeof(ack));
         }
         break;
 
@@ -253,8 +318,8 @@ static void send_status_report(void) {
         0x80,                 /* Battery level: full */
     };
 
-    esp_err_t ret = wiimote_l2cap_send_input(WIIMOTE_IN_STATUS,
-                                              status, sizeof(status));
+    esp_err_t ret = send_input_report(WIIMOTE_IN_STATUS,
+                                      status, sizeof(status));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to send status report: %s",
                  esp_err_to_name(ret));
@@ -287,12 +352,30 @@ esp_err_t wiimote_bt_send_buttons(uint8_t btn_byte0, uint8_t btn_byte1) {
      */
     uint8_t payload[2] = { btn_byte0, btn_byte1 };
 
-    esp_err_t ret = wiimote_l2cap_send_input(WIIMOTE_IN_BUTTONS,
-                                              payload, sizeof(payload));
+    esp_err_t ret = send_input_report(WIIMOTE_IN_BUTTONS,
+                                      payload, sizeof(payload));
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "send_buttons failed: %s", esp_err_to_name(ret));
     }
     return ret;
+}
+
+static esp_err_t send_input_report(uint8_t report_id,
+                                   const uint8_t *payload, uint16_t len)
+{
+    if (s_hid_dev == NULL || !esp_hidd_dev_connected(s_hid_dev)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t report[WIIMOTE_MAX_REPORT_LEN];
+    if (len > sizeof(report) || (len > 0 && payload == NULL)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (len > 0) {
+        memcpy(report, payload, len);
+    }
+
+    return esp_hidd_dev_input_set(s_hid_dev, 0, report_id, report, len);
 }
 
 /* -----------------------------------------------------------------------
@@ -349,7 +432,11 @@ static void reconnect_task(void *arg) {
     for (int attempt = 0; attempt < 10; attempt++) {
         if (s_state == WIIMOTE_STATE_CONNECTED) break;
         ESP_LOGI(TAG, "Reconnect attempt %d/10...", attempt + 1);
-        wiimote_l2cap_connect(s_wii_bda);
+        esp_err_t ret = esp_bt_hid_device_connect(s_wii_bda);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Reconnect attempt failed to start: %s",
+                     esp_err_to_name(ret));
+        }
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
 
@@ -372,9 +459,6 @@ esp_err_t wiimote_bt_init(void) {
         ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(ret));
         return ret;
     }
-
-    ret = wiimote_linkkey_init();
-    if (ret != ESP_OK) return ret;
 
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     bt_cfg.mode = ESP_BT_MODE_CLASSIC_BT;
@@ -411,7 +495,7 @@ esp_err_t wiimote_bt_init(void) {
         return ret;
     }
 
-    ret = esp_bt_dev_set_device_name(WIIMOTE_DEVICE_NAME);
+    ret = esp_bt_gap_set_device_name(WIIMOTE_DEVICE_NAME);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Set device name failed: %s", esp_err_to_name(ret));
         return ret;
@@ -443,16 +527,27 @@ esp_err_t wiimote_bt_init(void) {
         esp_bt_gap_set_security_param(sp_param, &iocap, sizeof(iocap));
     }
 
-    ret = wiimote_l2cap_init(output_report_handler);
-    if (ret != ESP_OK) return ret;
+    ret = load_wii_bda();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to load Wii address: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_report_maps[0].len = WIIMOTE_HID_DESCRIPTOR_LEN;
+    ret = esp_hidd_dev_init(&s_hid_config, ESP_HID_TRANSPORT_BT,
+                            hidd_event_handler, &s_hid_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "HID device initialization failed: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
 
     ret = wiimote_sdp_register();
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "SDP register returned: %s — continuing",
+        ESP_LOGE(TAG, "PnP SDP initialization failed: %s",
                  esp_err_to_name(ret));
+        return ret;
     }
-
-    load_wii_bda();
 
     ESP_LOGI(TAG, "Wiimote BT stack initialised");
     ESP_LOGI(TAG, "Device name : %s", WIIMOTE_DEVICE_NAME);
@@ -460,22 +555,6 @@ esp_err_t wiimote_bt_init(void) {
         const uint8_t *bda = esp_bt_dev_get_address();
         ESP_LOGI(TAG, "Own BDA     : %02X:%02X:%02X:%02X:%02X:%02X",
                  bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
-    }
-
-    if (s_wii_bda_known) {
-        /*
-         * A known Wii BDA exists — try to reconnect automatically.
-         * s_state will be set to RECONNECTING inside reconnect_task.
-         */
-        s_state = WIIMOTE_STATE_IDLE;
-        xTaskCreate(reconnect_task, "wii_reconnect", 4096, NULL, 5, NULL);
-    } else {
-        /*
-         * No bond yet — go discoverable so the Wii can find us.
-         * wiimote_bt_start_discoverable() sets s_state = DISCOVERABLE;
-         * do NOT overwrite it with IDLE afterwards.
-         */
-        wiimote_bt_start_discoverable();
     }
 
     return ESP_OK;

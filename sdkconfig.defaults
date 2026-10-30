@@ -8,6 +8,10 @@ CONFIG_BT_SPP_ENABLED=n
 # If SSP is active, Bluedroid forces modern key negotiation and the Wii
 # immediately drops the connection.
 CONFIG_BT_SSP_ENABLED=n
+CONFIG_BT_HID_ENABLED=y
+CONFIG_BT_HID_DEVICE_ENABLED=y
+CONFIG_BT_SDP_COMMON_ENABLED=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # BLE off - we only need Classic
 CONFIG_BT_BLE_ENABLED=n
@@ -15,8 +19,7 @@ CONFIG_GATTS_ENABLE=n
 CONFIG_GATTC_ENABLE=n
 CONFIG_BLE_MESH=n
 
-# HID device (we implement our own via GAP/L2CAP/SDP)
-CONFIG_BT_HID_DEVICE_ENABLED=n
+# HID device profile handles HID SDP and L2CAP channels.
 CONFIG_BT_HID_HOST_ENABLED=n
 
 # Bluedroid stack

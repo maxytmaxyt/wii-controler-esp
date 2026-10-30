@@ -14,7 +14,7 @@ extern "C" {
 extern const uint8_t  WIIMOTE_HID_DESCRIPTOR[];
 extern const uint16_t WIIMOTE_HID_DESCRIPTOR_LEN;
 
-/* Register both HID + PnP SDP records with the Bluedroid stack */
+/* Initialize SDP and register the Wii PnP device-identification record. */
 esp_err_t wiimote_sdp_register(void);
 
 #ifdef __cplusplus

@@ -6,10 +6,10 @@ Emulates a Nintendo Wii Remote (`RVL-CNT-01`) on an **ESP32 NodeMCU-32S** using 
 
 - ✅ Discoverable as `Nintendo RVL-CNT-01`
 - ✅ Correct Class of Device (`0x002504`)
-- ✅ Full SDP records (HID + PnP) with authentic Wiimote values
+- ✅ Classic HID device profile with the Wiimote report descriptor and PnP identity
 - ✅ Correct HID descriptor (raw bytes from a real Wii Remote)
 - ✅ Wiimote PIN pairing protocol (reversed BDA)
-- ✅ Link key persistence in NVS (bond survives reboot)
+- ✅ Bluetooth bond persistence through Bluedroid NVS storage
 - ✅ Auto-reconnect to Wii after power cycle
 - ✅ Status report (0x20) + ACK for data mode (0x12)
 - ✅ D-Pad: Up / Down / Left / Right
@@ -35,7 +35,7 @@ Internal pull-ups are enabled — **no external resistors needed**.
 | D-Pad Right | 22   | D22                       |
 | A Button    | 23   | D23                       |
 
-To use different pins, edit the `#define GPIO_*` lines at the top of `main/main.c`.
+To use different pins, edit the `#define GPIO_*` lines at the top of `src/main.c`.
 
 **Avoid these pins** (reserved / boot-sensitive on ESP32):
 - GPIO 0, 2, 5, 12, 15 — boot-strapping
