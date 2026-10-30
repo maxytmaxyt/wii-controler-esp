@@ -127,18 +127,26 @@ static void gap_event_handler(esp_bt_gap_cb_event_t event,
         uint8_t key_type;
         if (wiimote_linkkey_find(param->link_key_req.bda, key, &key_type)) {
             ESP_LOGI(TAG, "Found link key — sending to Wii");
-            esp_bt_gap_set_link_key(param->link_key_req.bda, key, key_type);
+            /*
+             * esp_bt_gap_set_link_key(bda, key) — ESP-IDF ≥ 5.1 public API.
+             * Provides the stored 16-byte link key to Bluedroid, which replies
+             * to the HCI LINK_KEY_REQUEST with HCI_LINK_KEY_REPLY.
+             */
+            esp_link_key link_key;
+            memcpy(link_key, key, sizeof(esp_link_key));
+            esp_bt_gap_set_link_key(param->link_key_req.bda, link_key);
         } else {
             ESP_LOGW(TAG, "No link key found — negative reply");
             /*
-             * Correct negative reply: pass the BDA with a zeroed key buffer
-             * and key_type = 0xFF to signal "no key".
-             * The Bluedroid stack interprets key_type >= 0x10 as invalid
-             * and will respond with a negative key reply (HCI_LK_NEG_REPLY).
+             * For a negative link key reply we call esp_bt_gap_set_link_key
+             * with a zeroed key buffer. Bluedroid detects an all-zero key as
+             * invalid and sends HCI_LINK_KEY_NEG_REPLY, which causes the Wii
+             * to fall back to PIN pairing — the correct behaviour for a
+             * first-time or unrecognised device.
              */
-            uint8_t zero_key[16] = {0};
-            esp_bt_gap_set_link_key(param->link_key_req.bda,
-                                    zero_key, 0xFF);
+            esp_link_key zero_key;
+            memset(zero_key, 0, sizeof(esp_link_key));
+            esp_bt_gap_set_link_key(param->link_key_req.bda, zero_key);
         }
         break;
     }
@@ -455,12 +463,21 @@ esp_err_t wiimote_bt_init(void) {
     }
 
     if (s_wii_bda_known) {
+        /*
+         * A known Wii BDA exists — try to reconnect automatically.
+         * s_state will be set to RECONNECTING inside reconnect_task.
+         */
+        s_state = WIIMOTE_STATE_IDLE;
         xTaskCreate(reconnect_task, "wii_reconnect", 4096, NULL, 5, NULL);
     } else {
+        /*
+         * No bond yet — go discoverable so the Wii can find us.
+         * wiimote_bt_start_discoverable() sets s_state = DISCOVERABLE;
+         * do NOT overwrite it with IDLE afterwards.
+         */
         wiimote_bt_start_discoverable();
     }
 
-    s_state = WIIMOTE_STATE_IDLE;
     return ESP_OK;
 }
 
