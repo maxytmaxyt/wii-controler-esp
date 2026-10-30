@@ -3,8 +3,18 @@
  *
  * Registers the two SDP service records that a real Nintendo RVL-CNT-01
  * exposes:
- *   Record 1 (handle 0x10000): HID service  (UUID 0x1124)
- *   Record 2 (handle 0x10001): PnP service  (UUID 0x1200)
+ *   Record 1: HID service  (UUID 0x1124)
+ *   Record 2: PnP service  (UUID 0x1200)
+ *
+ * ESP-IDF SDP API note:
+ *   esp_sdp_create_record() expects type = ESP_SDP_TYPE_RAW (not
+ *   ESP_SDP_TYPE_RAW_SDP — that enum value does not exist in the
+ *   public IDF headers).
+ *
+ * Buffer sizing:
+ *   The HID descriptor alone is ~150 bytes. With all SDP attributes the
+ *   HID record comfortably exceeds 256 bytes but stays well under 640.
+ *   Using 768 bytes gives a safe margin.
  */
 
 #include <string.h>
@@ -160,15 +170,18 @@ static uint8_t *sdp_put_attr_id(uint8_t *p, uint16_t attr_id) {
     return p;
 }
 
-/* We store the handle so we could de-register later if needed */
 static int s_hid_sdp_handle = -1;
 static int s_pnp_sdp_handle = -1;
 
 /* -----------------------------------------------------------------------
  * HID SDP record
+ *
+ * Buffer: 768 bytes — sized to hold all attributes plus the full HID
+ * descriptor (~150 bytes) with a comfortable margin.  The old 512-byte
+ * buffer was too small once all attributes were encoded.
  * ----------------------------------------------------------------------- */
 static esp_err_t register_hid_sdp_record(void) {
-    static uint8_t buf[512];
+    static uint8_t buf[768];
     uint8_t *p = buf;
 
     uint8_t *outer_len_p;
@@ -313,11 +326,21 @@ static esp_err_t register_hid_sdp_record(void) {
     p = sdp_put_bool(p, false);
 
     *outer_len_p = (uint8_t)(p - outer_len_p - 1);
-
     uint16_t record_len = (uint16_t)(p - buf);
 
+    /* Sanity check — should never fire, but guards against future edits */
+    if (record_len > sizeof(buf)) {
+        ESP_LOGE(TAG, "HID SDP record overflow: %u > %u bytes",
+                 record_len, (unsigned)sizeof(buf));
+        return ESP_ERR_NO_MEM;
+    }
+
+    /*
+     * Correct type: ESP_SDP_TYPE_RAW
+     * (ESP_SDP_TYPE_RAW_SDP does not exist in ESP-IDF public headers)
+     */
     esp_sdp_record_t sdp_rec = {
-        .type        = ESP_SDP_TYPE_RAW_SDP,
+        .type        = ESP_SDP_TYPE_RAW,
         .sdp_raw.len = record_len,
         .sdp_raw.val = buf,
     };
@@ -327,8 +350,8 @@ static esp_err_t register_hid_sdp_record(void) {
         ESP_LOGE(TAG, "Failed to register HID SDP record: %s",
                  esp_err_to_name(ret));
     } else {
-        ESP_LOGI(TAG, "HID SDP record registered (handle=%d)",
-                 s_hid_sdp_handle);
+        ESP_LOGI(TAG, "HID SDP record registered (handle=%d, len=%u)",
+                 s_hid_sdp_handle, record_len);
     }
     return ret;
 }
@@ -369,7 +392,7 @@ static esp_err_t register_pnp_sdp_record(void) {
     uint16_t len = (uint16_t)(p - buf);
 
     esp_sdp_record_t sdp_rec = {
-        .type        = ESP_SDP_TYPE_RAW_SDP,
+        .type        = ESP_SDP_TYPE_RAW,
         .sdp_raw.len = len,
         .sdp_raw.val = buf,
     };
@@ -379,8 +402,7 @@ static esp_err_t register_pnp_sdp_record(void) {
         ESP_LOGE(TAG, "Failed to register PnP SDP record: %s",
                  esp_err_to_name(ret));
     } else {
-        ESP_LOGI(TAG, "PnP SDP record registered (handle=%d)",
-                 s_pnp_sdp_handle);
+        ESP_LOGI(TAG, "PnP SDP record registered (handle=%d)", s_pnp_sdp_handle);
     }
     return ret;
 }
